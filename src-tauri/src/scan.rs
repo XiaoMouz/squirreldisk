@@ -6,7 +6,7 @@ use regex::{Captures, Regex};
 use tauri::api::process::{Command as TauriCommand, CommandEvent};
 use tauri::Manager;
 
-use crate::MyState;
+use crate::{MyState, IgnoreState};
 
 #[derive(Clone, serde::Serialize)]
 struct Payload {
@@ -65,7 +65,10 @@ pub fn start(
             match event {
                 CommandEvent::Stdout(line) => {
                     //println!("Stdout:{}", &line);
-                    app_handle.emit_all("scan_completed", line).ok();
+                    
+                    // Apply ignore filters to the scan results
+                    let filtered_line = filter_scan_results(&app_handle, &line);
+                    app_handle.emit_all("scan_completed", filtered_line).ok();
                 }
                 CommandEvent::Stderr(msg) => {
                     // println!("Stderr:{}", &msg);
@@ -225,4 +228,74 @@ fn emit_scan_status(app_handle: &tauri::AppHandle, groups: Captures) {
             },
         )
         .unwrap();
+}
+
+fn filter_scan_results(app_handle: &tauri::AppHandle, json_line: &str) -> String {
+    // Try to get ignore state
+    let ignore_state = match app_handle.try_state::<IgnoreState>() {
+        Some(state) => state,
+        None => return json_line.to_string(),
+    };
+
+    // Parse JSON
+    let mut data: serde_json::Value = match serde_json::from_str(json_line) {
+        Ok(d) => d,
+        Err(_) => return json_line.to_string(),
+    };
+
+    // Get ignore config
+    let config = match ignore_state.0.lock() {
+        Ok(c) => c,
+        Err(_) => return json_line.to_string(),
+    };
+
+    // Filter the tree recursively
+    if let Some(tree) = data.get_mut("tree") {
+        filter_tree_node(tree, &config);
+    }
+
+    serde_json::to_string(&data).unwrap_or_else(|_| json_line.to_string())
+}
+
+fn filter_tree_node(node: &mut serde_json::Value, config: &crate::ignore::IgnoreConfig) {
+    // Get the path/name of current node
+    let node_name = node.get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+    
+    // Check if this node should be ignored
+    if config.should_ignore(node_name) {
+        // Mark this node as filtered by setting size to 0
+        if let Some(obj) = node.as_object_mut() {
+            obj.insert("size".to_string(), serde_json::json!(0));
+            obj.insert("data".to_string(), serde_json::json!({"Bytes": 0}));
+            // Remove children to exclude them from visualization
+            obj.remove("children");
+        }
+        return;
+    }
+
+    // Recursively filter children
+    if let Some(children) = node.get_mut("children").and_then(|c| c.as_array_mut()) {
+        for child in children.iter_mut() {
+            filter_tree_node(child, config);
+        }
+        
+        // Remove children with size 0 (filtered out)
+        children.retain(|child| {
+            child.get("size")
+                .and_then(|s| s.as_u64())
+                .unwrap_or(1) > 0
+        });
+
+        // Recalculate parent size based on remaining children
+        let total_size: u64 = children.iter()
+            .filter_map(|child| child.get("size").and_then(|s| s.as_u64()))
+            .sum();
+        
+        if let Some(obj) = node.as_object_mut() {
+            obj.insert("size".to_string(), serde_json::json!(total_size));
+            obj.insert("data".to_string(), serde_json::json!({"Bytes": total_size}));
+        }
+    }
 }
