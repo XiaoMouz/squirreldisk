@@ -4,14 +4,16 @@
 )]
 mod scan;
 mod window_style;
+mod ignore;
 
 use regex::Regex;
 use serde::Serialize;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use sysinfo::{DiskExt, System, SystemExt};
 use tauri::api::process::CommandChild;
 use tauri::Manager;
+use crate::ignore::{IgnoreConfig, IgnorePattern};
 
 #[cfg(target_os = "macos")]
 use window_vibrancy::NSVisualEffectMaterial;
@@ -33,6 +35,11 @@ fn main() {
     tauri::Builder::default()
         .manage(MyState(Default::default()))
         .setup(|app| {
+            // Load ignore config
+            let config = IgnoreConfig::load(app.config().as_ref())
+                .unwrap_or_default();
+            app.manage(IgnoreState(Arc::new(Mutex::new(config))));
+            
             let window = app.get_window("main").unwrap();
             // window.open_devtools();
             #[cfg(target_os = "macos")]
@@ -56,7 +63,11 @@ fn main() {
             get_disks,
             start_scanning,
             stop_scanning,
-            show_in_folder
+            show_in_folder,
+            get_ignore_patterns,
+            add_ignore_pattern,
+            remove_ignore_pattern,
+            toggle_ignore_pattern
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -129,6 +140,7 @@ fn get_disks() -> String {
 }
 
 pub struct MyState(Mutex<Option<CommandChild>>);
+pub struct IgnoreState(Arc<Mutex<IgnoreConfig>>);
 
 #[tauri::command]
 fn start_scanning(
@@ -148,4 +160,68 @@ fn stop_scanning(
 ) -> Result<(), ()> {
     scan::stop(state);
     Ok(())
+}
+
+#[tauri::command]
+fn get_ignore_patterns(
+    ignore_state: tauri::State<'_, IgnoreState>,
+) -> Result<Vec<IgnorePattern>, String> {
+    let config = ignore_state.0.lock()
+        .map_err(|e| format!("Failed to lock ignore state: {}", e))?;
+    Ok(config.patterns.clone())
+}
+
+#[tauri::command]
+fn add_ignore_pattern(
+    app_handle: tauri::AppHandle,
+    ignore_state: tauri::State<'_, IgnoreState>,
+    pattern: String,
+) -> Result<(), String> {
+    let mut config = ignore_state.0.lock()
+        .map_err(|e| format!("Failed to lock ignore state: {}", e))?;
+    
+    // Check if pattern already exists
+    if config.patterns.iter().any(|p| p.pattern == pattern) {
+        return Err("Pattern already exists".to_string());
+    }
+    
+    config.patterns.push(IgnorePattern {
+        pattern,
+        enabled: true,
+    });
+    
+    config.save(app_handle.config().as_ref())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_ignore_pattern(
+    app_handle: tauri::AppHandle,
+    ignore_state: tauri::State<'_, IgnoreState>,
+    pattern: String,
+) -> Result<(), String> {
+    let mut config = ignore_state.0.lock()
+        .map_err(|e| format!("Failed to lock ignore state: {}", e))?;
+    
+    config.patterns.retain(|p| p.pattern != pattern);
+    config.save(app_handle.config().as_ref())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn toggle_ignore_pattern(
+    app_handle: tauri::AppHandle,
+    ignore_state: tauri::State<'_, IgnoreState>,
+    pattern: String,
+) -> Result<(), String> {
+    let mut config = ignore_state.0.lock()
+        .map_err(|e| format!("Failed to lock ignore state: {}", e))?;
+    
+    if let Some(p) = config.patterns.iter_mut().find(|p| p.pattern == pattern) {
+        p.enabled = !p.enabled;
+        config.save(app_handle.config().as_ref())?;
+        Ok(())
+    } else {
+        Err("Pattern not found".to_string())
+    }
 }
